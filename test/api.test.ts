@@ -99,6 +99,21 @@ describe("health + auth", () => {
     expect(rb.code).toBe("REPLAYED");
   });
 
+  it("rejects replayed nonces on the token verification endpoint", async () => {
+    const body = { token: "not-a-token" };
+    const first = await signedRequest("POST", "/v1/verify", body);
+    const firstResult = await call(first);
+    expect(firstResult.status).toBe(200);
+    expect(firstResult.body.valid).toBe(false);
+
+    const replay = await signedRequest("POST", "/v1/verify", body, {
+      nonce: first.headers.get("x-db-nonce") ?? "",
+    });
+    const replayResult = await call(replay);
+    expect(replayResult.status).toBe(401);
+    expect(replayResult.body.code).toBe("REPLAYED");
+  });
+
   it("admin requires the bearer key", async () => {
     const { status } = await call(new Request("https://license.diskgenie.test/v1/admin/stats"));
     expect(status).toBe(401);

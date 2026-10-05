@@ -29,6 +29,7 @@ import { publicKeyFromSeed, toHex, verifyToken } from "./crypto";
 import { ensureSchema } from "./schema";
 import type { Env } from "./types";
 import { json } from "./routes/shared";
+import { Db } from "./db";
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
@@ -62,6 +63,10 @@ export default {
         const raw = await request.text();
         const guard = await verifyAppRequest(env, request, path, raw);
         if ("fail" in guard) return json(401, { ok: false, code: guard.fail, message: "Request rejected." });
+        const nonce = request.headers.get("x-db-nonce") ?? "";
+        if (!(await new Db(env.DB).consumeNonce(nonce, Math.floor(Date.now() / 1000)))) {
+          return json(401, { ok: false, code: "REPLAYED", message: "Request rejected." });
+        }
         const body = JSON.parse(raw) as { token?: string };
         const pubHex = toHex(await publicKeyFromSeed(env.LICENSE_SIGNING_PRIVATE_KEY));
         const payload = body.token ? await verifyToken(pubHex, body.token) : null;
