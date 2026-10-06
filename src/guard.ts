@@ -32,7 +32,10 @@ export type GuardFailure =
   | "BAD_TIMESTAMP"
   | "REPLAYED"
   | "BAD_UA"
-  | "BAD_ADMIN_KEY";
+  | "BAD_ADMIN_KEY"
+  /** Token-level: a verified-signature token minted for another
+   *  product (aud mismatch) — 403 (see tokens.ts checkTokenClaims). */
+  | "BAD_AUDIENCE";
 
 export interface AppRequest {
   body: string;

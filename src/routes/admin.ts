@@ -7,6 +7,10 @@
  * keys ONCE, and emails them to the customer. Raw keys are never
  * stored.
  *
+ * Rate limiting (v3.1): every /v1/admin/* request consumes a per-route
+ * and a per-IP fixed-window bucket BEFORE the bearer check (invalid
+ * keys burn them too — see checkAdminRate below).
+ *
  * v2 additions:
  *   POST /v1/admin/lookup            { key } — resolve a RAW key the
  *                                     operator already has (purchase
@@ -20,7 +24,12 @@
  *                                     device counts + activation volume
  *
  * Routes (v1, unchanged contracts):
- *   POST /v1/admin/keys            { count?, tier, customerName, customerEmail, note?, days?, source? }
+ *   POST /v1/admin/keys            { count?, tier, customerName, customerEmail, note?, days?, source?, idempotencyKey? }
+ *                                  — also accepts an `Idempotency-Key` header:
+ *                                    same key ⇒ the committed batch is REPLAYED
+ *                                    (publicLicense view, `replayed: true`) with
+ *                                    no duplicate rows; raw keys come back only
+ *                                    on the FIRST request (they are never stored).
  *   GET  /v1/admin/keys?offset&limit[&email]
  *   GET  /v1/admin/keys/:id
  *   POST /v1/admin/keys/:id/revoke
@@ -29,13 +38,72 @@
  *   POST /v1/admin/devices/:id/revive     (undo a device reset)
  */
 import type { Env } from "../types";
-import { Db, type DeviceRow, type LicenseRow } from "../db";
+import { Db, type DeviceRow, type LicenseInsert, type LicenseRow } from "../db";
 import { generateKey, isValidKeyShape, normalizeKey } from "../keys";
 import { keyHashOf } from "../tokens";
 import { verifyAdmin } from "../guard";
+import { ipHashOf, sha256Hex } from "../crypto";
 import { fail, json, nowSec, normalizeKeyClaim, isValidPlatform } from "./shared";
 
 const YEAR_DAYS = 365;
+
+/** Idempotency keys are webhook-supplied opaque strings; anything past a
+ *  sane length is abuse, not a retry marker. */
+const MAX_IDEMPOTENCY_KEY = 200;
+
+// ── admin rate limiting ────────────────────────────────────────────────
+//
+// The admin routes shipped (v1–v3) with NO rate limit behind the bearer
+// check — an unlimited brute-force oracle on ADMIN_API_KEY, while every
+// app route was already limited. Two fixed-window buckets on the SAME
+// rate_buckets mechanism as the app routes, consumed BEFORE the bearer
+// check so even INVALID keys burn them (the brute-forcer is the exact
+// caller the limit exists for):
+//   * per ROUTE  — RATE_ADMIN_PER_HR (default 120): bounds any single
+//     admin operation globally (a runaway webhook retry loop can't
+//     hammer one endpoint);
+//   * per IP     — RATE_ADMIN_IP_PER_HR (default 240): bounds each
+//     source across ALL admin routes.
+
+const ADMIN_WINDOW_SEC = 3_600;
+const ADMIN_ROUTE_LIMIT = 120;
+const ADMIN_IP_LIMIT = 240;
+
+/** Env-var override with the documented default (same semantics as
+ *  keyLimitFor in shared.ts — absent/garbage falls back, never 0). */
+const envLimit = (raw: string | undefined, fallback: number): number => {
+  const n = Number.parseInt(raw ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+/** The bucket id for one admin operation: method + route shape with
+ *  numeric id segments normalized ("POST keys/:id/revoke"), so per-key
+ *  operations share one bucket per SHAPE, not one per row id. */
+function adminRouteId(method: string, parts: string[]): string {
+  return [method.toUpperCase(), ...parts.map((p) => (/^\d+$/.test(p) ? ":id" : p))].join(" ");
+}
+
+/** Consume the admin buckets; returns the 429 Response when exhausted,
+ *  null when the request may proceed. */
+async function checkAdminRate(
+  env: Env,
+  db: Db,
+  request: Request,
+  parts: string[],
+  now: number,
+): Promise<Response | null> {
+  const ipHash = await ipHashOf(env, request.headers.get("cf-connecting-ip"));
+  const route = adminRouteId(request.method, parts);
+  if (!(await db.rateConsume(`rl:admin:${route}`, envLimit(env.RATE_ADMIN_PER_HR, ADMIN_ROUTE_LIMIT), ADMIN_WINDOW_SEC, now))) {
+    await db.audit({ event: "denied", reason: "RATE_LIMITED", ipHash, now });
+    return fail(429, "RATE_LIMITED", "Too many admin requests — try again later.");
+  }
+  if (!(await db.rateConsume(`rl:admin:ip:${ipHash}`, envLimit(env.RATE_ADMIN_IP_PER_HR, ADMIN_IP_LIMIT), ADMIN_WINDOW_SEC, now))) {
+    await db.audit({ event: "denied", reason: "RATE_LIMITED", ipHash, now });
+    return fail(429, "RATE_LIMITED", "Too many admin requests from this network — try again later.");
+  }
+  return null;
+}
 
 interface GenerateBody {
   count?: number;
@@ -45,16 +113,22 @@ interface GenerateBody {
   note?: string;
   days?: number;
   source?: string;
+  idempotencyKey?: string;
 }
 
 export async function handleAdmin(env: Env, request: Request, url: URL): Promise<Response> {
-  const adminFail = verifyAdmin(env, request);
-  if (adminFail) return fail(401, adminFail, "Admin authentication failed.");
-
   const db = new Db(env.DB);
   const now = nowSec();
   const path = url.pathname.replace(/^\/v1\/admin\/?/, "").replace(/\/$/, "");
   const parts = path.split("/").filter(Boolean);
+
+  // Rate limit FIRST — before the bearer check — so even invalid keys
+  // burn the buckets (see the block above). The bearer check follows.
+  const limited = await checkAdminRate(env, db, request, parts, now);
+  if (limited) return limited;
+
+  const adminFail = verifyAdmin(env, request);
+  if (adminFail) return fail(401, adminFail, "Admin authentication failed.");
 
   // POST /v1/admin/keys — generate
   if (request.method === "POST" && parts.length === 1 && parts[0] === "keys") {
@@ -74,18 +148,59 @@ export async function handleAdmin(env: Env, request: Request, url: URL): Promise
     const days = body.days ?? YEAR_DAYS;
     if (!Number.isFinite(days) || days < 1 || days > 3650) return fail(400, "BAD_REQUEST", "days must be 1-3650.");
     const expiresAt = tier === "yearly" ? now + days * 86_400 : null;
-    const source = body.source === "webhook" ? "webhook" : body.source === "seed" ? "seed" : "admin";
 
-    const generated: { key: string; tier: string; name: string; email: string; expiresAt: number | null }[] = [];
-    for (let i = 0; i < count; i++) {
-      let key = "";
-      let inserted: LicenseRow | null = null;
-      // Retry on the (2^-50-scale) hash collision; shape guarantees uniqueness in practice.
-      for (let attempt = 0; attempt < 5 && !inserted; attempt++) {
-        key = normalizeKey(generateKey());
-        if (!isValidKeyShape(key)) continue;
-        try {
-          inserted = await db.insertLicense({
+    // Idempotency (webhook at-least-once delivery): when the caller
+    // supplies an Idempotency-Key header (or body field), the whole batch
+    // is recorded under the marker `idem:<sha256(key)>` in licenses.source,
+    // and a repeated request with the SAME key replays the already-
+    // committed rows instead of minting duplicates. TRADEOFF: raw keys are
+    // returned ONLY on the FIRST request (they are never stored), so the
+    // replay returns the publicLicense view + `replayed: true` — the
+    // caller must persist the raw keys from the first response. When no
+    // idempotency key is supplied, `source` keeps its webhook/seed/admin
+    // tag exactly as before.
+    const idemRaw =
+      request.headers.get("idempotency-key") ??
+      (typeof body.idempotencyKey === "string" ? body.idempotencyKey : "");
+    const idem = idemRaw.trim();
+    if (idem.length > MAX_IDEMPOTENCY_KEY) {
+      return fail(400, "BAD_REQUEST", "idempotencyKey too long (max 200 chars).");
+    }
+    const marker = idem.length > 0 ? `idem:${await sha256Hex(idem)}` : null;
+    if (marker !== null) {
+      const existing = await db.licensesBySource(marker);
+      if (existing.length > 0) {
+        await db.audit({ event: "admin", reason: `generate:replay:${existing.length}`, detail: marker, now });
+        return json(200, { ok: true, replayed: true, keys: existing.map(publicLicense) });
+      }
+    }
+    const source = marker ?? (body.source === "webhook" ? "webhook" : body.source === "seed" ? "seed" : "admin");
+
+    // ONE D1 batch = one implicit transaction: the whole generation
+    // commits or nothing does. (The previous per-key loop committed each
+    // insert separately, so a mid-loop failure returned GEN_FAILED with
+    // earlier keys already committed — their raw values lost forever,
+    // since only hashes are stored. All-or-nothing is the only safe
+    // shape for a one-shot reveal.)
+    let generated: { key: string; tier: string; name: string; email: string; expiresAt: number | null }[] | null = null;
+    for (let attempt = 0; attempt < 5 && generated === null; attempt++) {
+      // Fresh candidate set per attempt — the (2^-50-scale) hash-collision
+      // retry from the old per-key loop, now per BATCH: a collision with an
+      // existing row fails the whole transaction (zero rows committed) and
+      // we simply try again with new keys. In-batch duplicates are
+      // pre-filtered so the UNIQUE constraint never fires against our own
+      // set; shape guarantees uniqueness in practice.
+      const candidates: string[] = [];
+      const seen = new Set<string>();
+      while (candidates.length < count) {
+        const key = normalizeKey(generateKey());
+        if (!isValidKeyShape(key) || seen.has(key)) continue;
+        seen.add(key);
+        candidates.push(key);
+      }
+      try {
+        const rows: LicenseInsert[] = await Promise.all(
+          candidates.map(async (key) => ({
             keyHash: await keyHashOf(key),
             keyLast4: key.slice(-4),
             tier,
@@ -96,15 +211,18 @@ export async function handleAdmin(env: Env, request: Request, url: URL): Promise
             issuedAt: now,
             expiresAt,
             now,
-          });
-        } catch {
-          inserted = null;
-        }
+          })),
+        );
+        // The audit row rides INSIDE the transaction — a half-committed
+        // generation can never leave an audit trace without its keys (or
+        // vice versa).
+        await db.insertLicensesAtomic(rows, { event: "admin", reason: `generate:${tier}x${count}`, detail: source, now });
+        generated = candidates.map((key) => ({ key, tier, name, email, expiresAt }));
+      } catch {
+        generated = null; // rolled back wholesale — safe to retry
       }
-      if (!inserted) return fail(500, "GEN_FAILED", "Key generation failed — retry.");
-      generated.push({ key, tier, name, email, expiresAt });
     }
-    await db.audit({ event: "admin", reason: `generate:${tier}x${count}`, detail: source, now });
+    if (generated === null) return fail(500, "GEN_FAILED", "Key generation failed — retry.");
     return json(200, { ok: true, keys: generated });
   }
 

@@ -82,6 +82,34 @@ export class SlotTakenError extends Error {
   }
 }
 
+/** One licenses-row INSERT (shared by the single-row and batch paths
+ *  so the column list + status default live in exactly one place). */
+export interface LicenseInsert {
+  keyHash: string;
+  keyLast4: string;
+  tier: "yearly" | "lifetime";
+  customerName: string;
+  customerEmail: string;
+  note: string | null;
+  source: string | null;
+  issuedAt: number;
+  expiresAt: number | null;
+  now: number;
+}
+
+/** One audit_events-row INSERT (shared by audit() and the atomic batch). */
+export interface AuditInsert {
+  licenseId?: number | null;
+  keyLast4?: string | null;
+  event: string;
+  platform?: string | null;
+  hwPrefix?: string | null;
+  reason?: string | null;
+  ipHash?: string | null;
+  detail?: string | null;
+  now: number;
+}
+
 /** True when the claim carries ANY v3 field — sets the row's facts_v3
  * provenance marker ("this client already speaks v3"), so support can
  * tell an old client from hardware that refuses to report a fact. */
@@ -99,6 +127,27 @@ const isSlotConstraint = (err: unknown): boolean => {
   // D1 surfaces SQLite's message: "UNIQUE constraint failed: devices.license_id, devices.platform"
   return msg.includes("UNIQUE constraint failed") && msg.includes("devices.");
 };
+
+/** The licenses INSERT shared by the single-row and batch paths — the
+ *  column list + the 'active' status default live in exactly one place. */
+const LICENSE_INSERT_SQL = `
+  INSERT INTO licenses
+    (key_hash, key_last4, tier, status, customer_name, customer_email,
+     note, source, issued_at, expires_at, created_at, updated_at)
+  VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)`;
+
+const LICENSE_INSERT_BINDS = (l: LicenseInsert): unknown[] => [
+  l.keyHash,
+  l.keyLast4,
+  l.tier,
+  l.customerName,
+  l.customerEmail,
+  l.note,
+  l.source,
+  l.issuedAt,
+  l.expiresAt,
+  l.now,
+];
 
 export class Db {
   constructor(private readonly d1: D1Database) {}
@@ -148,43 +197,37 @@ export class Db {
       .then((r) => r?.n ?? 0);
   }
 
-  insertLicense(license: {
-    keyHash: string;
-    keyLast4: string;
-    tier: "yearly" | "lifetime";
-    customerName: string;
-    customerEmail: string;
-    note: string | null;
-    source: string | null;
-    issuedAt: number;
-    expiresAt: number | null;
-    now: number;
-  }): Promise<LicenseRow> {
+  /** The prepared licenses INSERT (columns/status in one place — shared
+   *  by the atomic batch below; the generate route is the only writer). */
+  private licenseInsertStatement(license: LicenseInsert): D1PreparedStatement {
+    return this.d1.prepare(LICENSE_INSERT_SQL).bind(...LICENSE_INSERT_BINDS(license));
+  }
+
+  /** Idempotency-marker lookup (admin batch generation): every key of an
+   *  idempotent batch carries `idem:<sha256(idempotency-key)>` in
+   *  `source` — see routes/admin.ts. */
+  licensesBySource(source: string): Promise<LicenseRow[]> {
     return this.d1
-      .prepare(
-        `INSERT INTO licenses
-           (key_hash, key_last4, tier, status, customer_name, customer_email,
-            note, source, issued_at, expires_at, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
-         RETURNING *`,
-      )
-      .bind(
-        license.keyHash,
-        license.keyLast4,
-        license.tier,
-        license.customerName,
-        license.customerEmail,
-        license.note,
-        license.source,
-        license.issuedAt,
-        license.expiresAt,
-        license.now,
-      )
-      .first<LicenseRow>()
-      .then((r) => {
-        if (!r) throw new Error("insert license returned no row");
-        return r;
-      });
+      .prepare("SELECT * FROM licenses WHERE source = ?1 ORDER BY id")
+      .bind(source)
+      .all<LicenseRow>()
+      .then((r) => r.results);
+  }
+
+  /**
+   * Insert a WHOLE generation batch + its audit row in ONE D1 `batch()`
+   * call — an implicit transaction: every statement commits or none
+   * does. The admin generate route previously inserted keys one-by-one,
+   * so a mid-loop failure left earlier keys committed while their raw
+   * values were already lost to the caller (only hashes persist — the
+   * raw keys were unrecoverable). Atomicity restores all-or-nothing
+   * semantics (principles: transactions enforce the invariants, not
+   * check-then-write application code).
+   */
+  insertLicensesAtomic(licenses: LicenseInsert[], audit: AuditInsert): Promise<void> {
+    const stmts = licenses.map((l) => this.licenseInsertStatement(l));
+    stmts.push(this.auditStatement(audit));
+    return this.d1.batch(stmts).then(() => undefined);
   }
 
   setLicenseStatus(id: number, status: LicenseRow["status"], now: number): Promise<void> {
@@ -445,17 +488,8 @@ export class Db {
 
   // ── audit ─────────────────────────────────────────────────────────
 
-  audit(event: {
-    licenseId?: number | null;
-    keyLast4?: string | null;
-    event: string;
-    platform?: string | null;
-    hwPrefix?: string | null;
-    reason?: string | null;
-    ipHash?: string | null;
-    detail?: string | null;
-    now: number;
-  }): Promise<void> {
+  /** The prepared audit INSERT (shared by audit() + the atomic batch). */
+  private auditStatement(event: AuditInsert): D1PreparedStatement {
     return this.d1
       .prepare(
         `INSERT INTO audit_events
@@ -472,9 +506,11 @@ export class Db {
         event.ipHash ?? null,
         event.detail ?? null,
         event.now,
-      )
-      .run()
-      .then(() => undefined);
+      );
+  }
+
+  audit(event: AuditInsert): Promise<void> {
+    return this.auditStatement(event).run().then(() => undefined);
   }
 
   recentAudit(limit: number): Promise<AuditRow[]> {

@@ -28,6 +28,7 @@ export const GUARD_STATUS: Record<GuardFailure, number> = {
   REPLAYED: 401,
   BAD_UA: 403,
   BAD_ADMIN_KEY: 401,
+  BAD_AUDIENCE: 403,
 };
 
 export function nowSec(): number {
@@ -35,7 +36,7 @@ export function nowSec(): number {
 }
 
 /** Request bodies are tiny (≤ a few KB); anything bigger is abuse. */
-const MAX_BODY_BYTES = 16_384;
+export const MAX_BODY_BYTES = 16_384;
 
 /**
  * The app-facing guard: read the body ONCE (Workers bodies are

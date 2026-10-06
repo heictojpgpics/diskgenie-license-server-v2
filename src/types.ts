@@ -22,6 +22,12 @@ export interface Env {
   RATE_ACTIVATE_IP_PER_HR?: string;
   /** Validate attempts per key per hour (var, default 60). */
   RATE_VALIDATE_KEY_PER_HR?: string;
+  /** Admin requests per ROUTE per hour (var, default 120) — bounds any
+   *  single admin operation globally (webhook retry loops). */
+  RATE_ADMIN_PER_HR?: string;
+  /** Admin requests per IP per hour (var, default 240) — bounds each
+   *  source across ALL admin routes (brute-force containment). */
+  RATE_ADMIN_IP_PER_HR?: string;
 }
 
 /** The client's hardware fingerprint claim.
@@ -76,10 +82,20 @@ export interface DeviceClaim {
   compFirmware?: string;
 }
 
-/** Entitlement token payload (Ed25519-signed; b64url(json).b64url(sig)). */
+/** Entitlement token payload (Ed25519-signed; b64url(json).b64url(sig)).
+ *
+ * kid/aud (v3.1, additive — the compat window): NEWLY minted tokens
+ * name their signing key (kid — see tokens.ts KID_REGISTRY) and their
+ * product (aud = "diskgenie"). Tokens minted before the claims existed
+ * (the deployed fleet) simply omit both fields and keep verifying;
+ * verification enforces the values whenever they are PRESENT. */
 export interface TokenPayload {
   iss: "db-license";
   ver: 1;
+  /** Signing key id (tokens.ts kidRegistry) — rotation groundwork. */
+  kid?: number;
+  /** Audience — the product this token was minted for. */
+  aud?: string;
   jti: string;
   iat: number;
   exp: number;

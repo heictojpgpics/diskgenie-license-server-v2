@@ -132,6 +132,8 @@ vars) in sync with the app's `GRACE_DAYS` (14 by default).
 | wrangler.jsonc | `vars.TOKEN_TTL_DAYS` | offline grace window (default 14) |
 | wrangler.jsonc | `vars.RATE_ACTIVATE_KEY_PER_HR` | activate/deactivate attempts per key per hour (default 10) |
 | wrangler.jsonc | `vars.RATE_VALIDATE_KEY_PER_HR` | validate attempts per key per hour (default 60) |
+| wrangler.jsonc | `vars.RATE_ADMIN_PER_HR` | admin requests per ROUTE per hour (default 120; consumed BEFORE the bearer check) |
+| wrangler.jsonc | `vars.RATE_ADMIN_IP_PER_HR` | admin requests per IP per hour across ALL admin routes (default 240) |
 | secret | `LICENSE_SIGNING_PRIVATE_KEY` | 64-hex Ed25519 seed |
 | secret | `ADMIN_API_KEY` | random 32+ chars (admin API bearer) |
 | secret | `CLIENT_REQUEST_SECRET` | 64-hex HMAC secret — MUST match the app's `CLIENT_SECRET_HEX` |
@@ -193,7 +195,7 @@ All admin routes require `Authorization: Bearer <ADMIN_API_KEY>`.
 
 | Method | Route | Body / Query | Returns |
 |---|---|---|---|
-| POST | `/v1/admin/keys` | `{ count?, tier, customerName, customerEmail, note?, days?, source? }` | `{ keys: [{ key, tier, name, email, expiresAt }] }` |
+| POST | `/v1/admin/keys` | `{ count?, tier, customerName, customerEmail, note?, days?, source?, idempotencyKey? }` | `{ keys: [{ key, tier, name, email, expiresAt }] }` — ONE D1 transaction (all-or-nothing); send an `Idempotency-Key` header (or `idempotencyKey` field) and a retried request REPLAYS the committed batch (`{ replayed: true, keys: [publicLicense] }`, no raw keys — they exist only in the first response) |
 | POST | `/v1/admin/lookup` | `{ key: "DB-…" }` | `{ license, devices }` — resolve a RAW key (support has it from the purchase email) |
 | GET | `/v1/admin/keys?offset&limit&email=` | — | `{ total, keys: [publicLicense] }` (no raw keys; email filter = "customer lost the key") |
 | GET | `/v1/admin/keys/:id` | — | `{ license, devices: [full v2 device view] }` |
@@ -214,7 +216,9 @@ Error codes the app maps to typed UX copy: `KEY_NOT_FOUND`,
 `KEY_REVOKED`, `KEY_REFUNDED`, `LICENSE_EXPIRED`, `DEVICE_MISMATCH`,
 `DEVICE_SLOT_TAKEN`, `REPLAYED`, `BAD_SIGNATURE`, `RATE_LIMITED` (429,
 returned by the D1 fixed-window limiter once the per-key or per-IP
-budget is exhausted), `SERVER_ERROR`.
+budget is exhausted — the admin routes are limited too: per-route AND
+per-IP, consumed before the bearer check), `BAD_AUDIENCE` (403 — a
+verified-signature token minted for another product), `SERVER_ERROR`.
 
 ## 8. Local development + sample database
 
@@ -262,6 +266,28 @@ npx wrangler d1 execute DB --remote --command "SELECT event, reason, created_at 
   an app update carrying the new public key. Old tokens die at their
   next validation (≤ 24 h + grace), forcing a one-time revalidation.
 
+  ### Rotation with kid + aud (v3.1)
+
+  Every newly minted token now carries two rotation claims
+  (`src/tokens.ts`): `"kid": <key id>` and `"aud": "diskgenie"`.
+  The **kid registry** (`kidRegistry`) maps kid → signing seed; today it
+  holds exactly one entry — kid 1 IS `LICENSE_SIGNING_PRIVATE_KEY`
+  (the current seed; unchanged — this is groundwork, not a rotation).
+  Verification accepts tokens WITHOUT the claims (the deployed fleet
+  carries pre-kid tokens — the same compat-window principle as the UA
+  rename), but enforces them WHEN PRESENT: `aud` must equal
+  `"diskgenie"` (else 403 `BAD_AUDIENCE`) and `kid` must be a
+  registered key id (else 401 `BAD_SIGNATURE` — a token naming a key
+  we never minted with). A future rotation therefore becomes:
+  1. Generate the new keypair; add the new seed to the registry as
+     kid 2 and start minting with it (the registry then holds both).
+  2. Ship the app update carrying the new PUBLIC key.
+  3. Keep kid 1 in the registry until every 14-day token it signed has
+     expired, then retire the kid-1 entry — old tokens verify against
+     kid 1 during the overlap instead of hard-dying at their next 24 h
+     check. The Rust client should prefer the token's `kid` when
+     selecting which embedded public key to verify with.
+
 ## 10. Testing + CI
 
 ```bash
@@ -270,19 +296,25 @@ npm test          # vitest with @cloudflare/vitest-pool-workers:
 npm run typecheck
 ```
 
-51 tests cover: the full activation lifecycle, per-platform device
+72 tests cover: the full activation lifecycle, per-platform device
 slots, same-hardware re-activation, stranger-device rejection,
 deactivation → re-registration, revocation, refund, yearly expiry,
 renewal, identity transfer, raw-key lookup, email filtering, the
 global device census, stats, nonce replay rejection, HMAC tampering,
-clock skew, oversized bodies, admin auth, batch generation,
-raw-keys-never-stored, device reset, the Ed25519 tamper-detection
-matrix, and the v2 regressions: **facts survive validate (the wipe
-bug)**, sparse claims never blank stored facts, garbage fields are
-dropped, the live-slot partial index blocks duplicates even by direct
-SQL, a revived row cannot displace the device that took its slot,
-per-key rate limits trip at the 11th attempt and reset on a new window,
-and change detection audits OS/app diffs. GitHub Actions runs both on
+clock skew, oversized bodies (including /v1/verify), admin auth,
+batch generation (transactional: a mid-batch failure commits zero
+rows; idempotent: a repeated Idempotency-Key replays without
+duplicates), raw-keys-never-stored, device reset, admin rate limiting
+(per-route + per-IP, fired before the bearer check), token kid/aud
+claims (new tokens carry kid=1 + aud; legacy tokens still verify;
+wrong audience → BAD_AUDIENCE; unknown kid → BAD_SIGNATURE), the
+Ed25519 tamper-detection matrix, and the v2 regressions: **facts
+survive validate (the wipe bug)**, sparse claims never blank stored
+facts, garbage fields are dropped, the live-slot partial index blocks
+duplicates even by direct SQL, a revived row cannot displace the
+device that took its slot, per-key rate limits trip at the 11th
+attempt and reset on a new window, and change detection audits OS/app
+diffs. GitHub Actions runs both on
 every push (`.github/workflows/ci.yml`).
 
 ## 11. Operations
@@ -294,9 +326,11 @@ every push (`.github/workflows/ci.yml`).
 - **Backups:** D1 → Settings → Export (SQL dump) on a schedule you
   choose; the license table is tiny (hashes + metadata).
 - **Rate limiting:** the Worker enforces per-key and per-IP fixed
-  windows (D1) on activate/validate/deactivate — tune via the
-  `RATE_*` vars. For volumetric abuse add a Cloudflare WAF rate rule
-  on the route too (dashboard-only, zero code).
+  windows (D1) on activate/validate/deactivate AND per-route + per-IP
+  on every admin route (consumed before the bearer check, so invalid
+  keys burn the buckets) — tune via the `RATE_*` vars. For volumetric
+  abuse add a Cloudflare WAF rate rule on the route too
+  (dashboard-only, zero code).
 
 ## 12. File map
 
@@ -320,5 +354,5 @@ src/keys.ts                    Key generation + normalization
 src/tokens.ts                  Token minting + response shaping
 src/db.ts                      D1 query layer (COALESCE writes, rate upserts)
 scripts/                       keypair + secret + batch-key + local-seed generators
-test/                          51 vitest tests (real runtime + D1)
+test/                          72 vitest tests (real runtime + D1)
 ```

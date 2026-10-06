@@ -9,8 +9,9 @@ import { env } from "cloudflare:test";
 import worker from "../src/index";
 import type { Env } from "../src/types";
 import { keyHashOf } from "../src/tokens";
-import { signedRequest, hw } from "./client";
-import { TEST_ADMIN_KEY } from "./constants";
+import { hmacHex, ipHashOf, randomHex, sha256Hex } from "../src/crypto";
+import { signedRequest, hw, UA } from "./client";
+import { TEST_ADMIN_KEY, TEST_CLIENT_SECRET } from "./constants";
 
 const ctx = undefined as unknown as ExecutionContext;
 
@@ -444,10 +445,104 @@ describe("admin v2 surface", () => {
   });
 });
 
+describe("admin rate limiting (brute-force containment)", () => {
+  // The bucket window the code computes (fixed hour window) — pre-seeding
+  // a bucket at a chosen count lets each test sit exactly at the edge
+  // instead of burning 120 real requests.
+  const windowStart = () => Math.floor(Date.now() / 1000 / 3_600) * 3_600;
+  const seedBucket = async (key: string, count: number) => {
+    await env.DB.prepare("INSERT INTO rate_buckets (bucket_key, window_start, count) VALUES (?1, ?2, ?3)")
+      .bind(key, windowStart(), count)
+      .run();
+  };
+
+  it("hammering an admin route past the per-route limit returns 429", async () => {
+    // 115 already consumed → five more pass (120), the sixth crosses.
+    await seedBucket("rl:admin:GET stats", 115);
+    let last = 0;
+    for (let i = 0; i < 6; i++) {
+      last = (await admin("/v1/admin/stats")).status;
+    }
+    expect(last).toBe(429);
+    // The refused request carries the same error body shape as the app routes.
+    const res = await admin("/v1/admin/stats");
+    expect(res.status).toBe(429);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.code).toBe("RATE_LIMITED");
+  });
+
+  it("the limit fires BEFORE the bearer check — invalid keys burn the bucket", async () => {
+    await seedBucket("rl:admin:POST keys", 120);
+    // A WRONG bearer key would normally 401; the exhausted bucket 429s
+    // first — that is the point: brute force cannot probe ADMIN_API_KEY
+    // without limit.
+    const bad = await call(new Request("https://license.diskgenie.test/v1/admin/keys", {
+      method: "POST",
+      headers: { authorization: "Bearer wrong-key", "content-type": "application/json" },
+      body: JSON.stringify({ tier: "lifetime", customerName: "x", customerEmail: "x@y.z" }),
+    }));
+    expect(bad.status).toBe(429);
+    expect(bad.body.code).toBe("RATE_LIMITED");
+    // ...and a VALID key is refused in the same window too.
+    const good = await admin("/v1/admin/keys", {
+      method: "POST",
+      body: JSON.stringify({ tier: "lifetime", customerName: "y", customerEmail: "y@z.w" }),
+    });
+    expect(good.status).toBe(429);
+  });
+
+  it("the per-IP admin bucket limits each source across ALL admin routes", async () => {
+    // No cf-connecting-ip in the test harness → the worker hashes the
+    // "unknown" IP; compute the same salted hash to pre-exhaust the bucket.
+    const ipHash = await ipHashOf(env as unknown as Env, null);
+    await seedBucket(`rl:admin:ip:${ipHash}`, 240);
+    // A DIFFERENT route (fresh per-route bucket) is still refused: the
+    // per-IP bucket spans every admin route.
+    const res = await admin("/v1/admin/stats");
+    expect(res.status).toBe(429);
+    expect(res.body.code).toBe("RATE_LIMITED");
+  });
+});
+
 describe("protocol hardening", () => {
   it("oversized bodies are rejected before parsing", async () => {
     const big = { licenseKey: "DB" + "0".repeat(20), hardwareHash: hw(1), platform: "windows", pad: "x".repeat(20_000) };
     const res = await call(signedRequest("POST", "/v1/activate", big));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("BAD_REQUEST");
+  });
+
+  it("oversized bodies on /v1/verify are rejected too (the same guard)", async () => {
+    // The debug endpoint must share the app routes' body-size guard —
+    // it is HMAC-authenticated like them, so it is the same abuse
+    // surface (the guard order is size-first, even before the HMAC).
+    const res = await call(signedRequest("POST", "/v1/verify", { token: "x".repeat(20_000) }));
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe("BAD_REQUEST");
+  });
+
+  it("an invalid JSON body on /v1/verify is a 400, not a 500", async () => {
+    // Signed raw garbage: the request clears the HMAC guard (it is a
+    // valid signature over invalid-JSON bytes — a client bug), and must
+    // be reported as the client's fault, not SERVER_ERROR.
+    const raw = "not-json{";
+    const timestamp = Date.now();
+    const nonce = randomHex(16);
+    const bodyHash = await sha256Hex(raw);
+    const signature = await hmacHex(TEST_CLIENT_SECRET, `${timestamp}.${nonce}.POST./v1/verify.${bodyHash}`);
+    const res = await call(new Request("https://license.diskgenie.test/v1/verify", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "user-agent": UA,
+        "x-db-app": "diskgenie",
+        "x-db-version": "0.1.0",
+        "x-db-timestamp": String(timestamp),
+        "x-db-nonce": nonce,
+        "x-db-signature": signature,
+      },
+      body: raw,
+    }));
     expect(res.status).toBe(400);
     expect(res.body.code).toBe("BAD_REQUEST");
   });

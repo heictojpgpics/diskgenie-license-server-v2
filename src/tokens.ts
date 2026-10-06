@@ -7,6 +7,42 @@ import type { Env, EntitlementResponse, TokenPayload } from "./types";
 import { randomHex, signToken } from "./crypto";
 import { sha256Hex } from "./crypto";
 
+/** The product this server issues tokens for — the `aud` (audience)
+ *  claim. A token minted for another product (or a lookalike licensing
+ *  server reusing this claim shape) must not verify here. */
+export const TOKEN_AUDIENCE = "diskgenie";
+
+/** The kid (key id) of the CURRENT signing seed — bumped at every seed
+ *  rotation (README §9); the deployed fleet then carries a mix of kids
+ *  during the overlap window, which is exactly what the registry below
+ *  is for. */
+export const CURRENT_KID = 1;
+
+/** kid → signing seed (the KID_REGISTRY). Today exactly one key is live:
+ *  kid 1 IS `LICENSE_SIGNING_PRIVATE_KEY`. At a rotation you add the
+ *  incoming seed under kid 2, keep kid 1 until every 14-day token it
+ *  signed has expired, then retire the kid-1 entry — verification picks
+ *  the key by the token's claim instead of assuming a single seed. */
+export function kidRegistry(env: Env): Map<number, string> {
+  return new Map([[CURRENT_KID, env.LICENSE_SIGNING_PRIVATE_KEY]]);
+}
+
+/**
+ * Claim check for the verification paths (/v1/verify + tests): tokens
+ * minted BEFORE kid/aud existed (the deployed fleet — the compat
+ * window) verify unchanged, but a token that CARRIES the claims must
+ * carry the right ones: `aud` must be this product, `kid` must be a
+ * registered key id. Returns the error code that applies, or "ok".
+ */
+export function checkTokenClaims(env: Env, payload: object): "ok" | "BAD_AUDIENCE" | "BAD_SIGNATURE" {
+  const p = payload as { kid?: unknown; aud?: unknown };
+  if (p.aud !== undefined && p.aud !== TOKEN_AUDIENCE) return "BAD_AUDIENCE";
+  if (p.kid !== undefined && !(typeof p.kid === "number" && kidRegistry(env).has(p.kid))) {
+    return "BAD_SIGNATURE";
+  }
+  return "ok";
+}
+
 /** Token grace window (seconds) — TOKEN_TTL_DAYS, default 14 days. */
 export function tokenTtlSeconds(env: Env): number {
   const days = Number.parseInt(env.TOKEN_TTL_DAYS ?? "14", 10);
@@ -31,6 +67,12 @@ export async function mintToken(
   const payload: TokenPayload = {
     iss: "db-license",
     ver: 1,
+    // Rotation groundwork: every NEWLY minted token names its signing
+    // key (kid) and its product (aud). Verification accepts tokens
+    // without them (the deployed fleet's compat window) but enforces the
+    // values when present — see checkTokenClaims.
+    kid: CURRENT_KID,
+    aud: TOKEN_AUDIENCE,
     jti: randomHex(16),
     iat: now,
     exp: now + tokenTtlSeconds(env),

@@ -52,7 +52,14 @@
     // Rate limiting (per-key activate attempts per hour; default 10).
     // Validate is 6x the activate limit; deactivate matches activate.
     // The per-IP activate limit (30/h) is code-level, not a var.
-    "RATE_ACTIVATE_KEY_PER_HR": "10"
+    "RATE_ACTIVATE_KEY_PER_HR": "10",
+    // Admin API limits (bearer-key surface — consumed BEFORE the bearer
+    // check, so even invalid keys burn the buckets; brute force cannot
+    // probe ADMIN_API_KEY unlimited): per-route 120/h bounds any single
+    // operation globally, per-IP 240/h bounds each source across ALL
+    // admin routes.
+    "RATE_ADMIN_PER_HR": "120",
+    "RATE_ADMIN_IP_PER_HR": "240"
   },
   "d1_databases": [
     {

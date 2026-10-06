@@ -10,7 +10,7 @@ import { env } from "cloudflare:test";
 import worker from "../src/index";
 import type { Env } from "../src/types";
 import { generateKey, normalizeKey } from "../src/keys";
-import { publicKeyFromSeed, toHex } from "../src/crypto";
+import { publicKeyFromSeed, signToken, toHex } from "../src/crypto";
 import { keyHashOf } from "../src/tokens";
 import { signedRequest, hw } from "./client";
 import { TEST_ADMIN_KEY, TEST_SIGNING_SEED } from "./constants";
@@ -23,11 +23,17 @@ const call = async (req: Request | Promise<Request>) => {
   const res = await worker.fetch(await req, env as unknown as Env, ctx);
   return { status: res.status, body: (await res.json()) as Record<string, any> };
 };
-const admin = async (path: string, init?: RequestInit) =>
-  call(new Request(`https://license.diskgenie.test${path}`, {
-    headers: { authorization: `Bearer ${TEST_ADMIN_KEY}`, ...init?.headers },
-    ...init,
+// NOTE: `init.headers` MERGES with the bearer header — spreading the
+// raw `...init` after `headers:` (the v1 helper) would replace the
+// merged object and silently drop the bearer key whenever a test passed
+// its own headers.
+const admin = async (path: string, init?: RequestInit) => {
+  const { headers, ...rest } = init ?? {};
+  return call(new Request(`https://license.diskgenie.test${path}`, {
+    ...rest,
+    headers: { authorization: `Bearer ${TEST_ADMIN_KEY}`, ...(headers as Record<string, string> | undefined) },
   }));
+};
 const activate = (key: string, platform: string, hardwareHash: string) =>
   call(signedRequest("POST", "/v1/activate", {
     licenseKey: key, hardwareHash, platform,
@@ -142,6 +148,10 @@ describe("activation lifecycle", () => {
     const payload = JSON.parse(atob(p.replace(/-/g, "+").replace(/_/g, "/")));
     expect(payload.iss).toBe("db-license");
     expect(payload.ver).toBe(1);
+    // v3.1 rotation groundwork: every newly minted token names its
+    // signing key (kid 1 = the current seed) and its product (aud).
+    expect(payload.kid).toBe(1);
+    expect(payload.aud).toBe("diskgenie");
     expect(payload.plat).toBe("windows");
     expect(payload.hw).toBe(hw(7));
     expect(payload.key).toBe(await keyHashOf(normalizeKey(key)));
@@ -315,6 +325,153 @@ describe("admin surface", () => {
     // The slot is free now — a different device can activate.
     const other = await activate(key, "windows", hw(62));
     expect(other.status).toBe(200);
+  });
+});
+
+describe("transactional + idempotent batch generation", () => {
+  const countAll = async () =>
+    (await env.DB.prepare("SELECT COUNT(*) AS n FROM licenses").first<{ n: number }>())?.n ?? 0;
+
+  it("generation commits the exact requested count (all-or-nothing positive path)", async () => {
+    const gen = await admin("/v1/admin/keys", {
+      method: "POST",
+      body: JSON.stringify({ count: 7, tier: "lifetime", customerName: "Count Check", customerEmail: "count@example.com" }),
+    });
+    expect(gen.status).toBe(200);
+    expect(gen.body.keys.length).toBe(7);
+    expect(await countAll()).toBe(7); // nothing more, nothing less
+  });
+
+  it("a mid-batch DB failure commits ZERO rows (one D1 batch = one transaction)", async () => {
+    // Pre-existing row whose key_hash the injected statement collides
+    // with — guarantees a mid-batch UNIQUE violation regardless of the
+    // random keys the route mints.
+    const now = Math.floor(Date.now() / 1000);
+    const collisionHash = "e" + "0".repeat(63);
+    await env.DB.prepare(
+      "INSERT INTO licenses (key_hash, key_last4, tier, status, customer_name, customer_email, issued_at, created_at, updated_at) VALUES (?1, 'BEEF', 'lifetime', 'active', 'Collision', 'col@example.com', ?2, ?2, ?2)",
+    ).bind(collisionHash, now).run();
+    expect(await countAll()).toBe(1);
+
+    // Wrap env.DB.batch (the primitive the route must use for ONE
+    // transactional insert) so the route's batch is spliced with a
+    // colliding statement right after its FIRST insert. If the route
+    // still inserted key-by-key, insert #1 would already be committed;
+    // all-or-nothing means the count stays exactly at 1.
+    const dbAny = env.DB as { batch: (stmts: D1PreparedStatement[]) => Promise<unknown[]> };
+    const realBatch = dbAny.batch.bind(env.DB);
+    dbAny.batch = async (stmts: D1PreparedStatement[]) => {
+      const collide = env.DB.prepare(
+        "INSERT INTO licenses (key_hash, key_last4, tier, status, customer_name, customer_email, issued_at, created_at, updated_at) VALUES (?1, 'BEEF', 'yearly', 'active', 'Collision2', 'col2@example.com', ?2, ?2, ?2)",
+      ).bind(collisionHash, now);
+      return realBatch([stmts[0]!, collide, ...stmts.slice(1)]);
+    };
+    try {
+      const gen = await admin("/v1/admin/keys", {
+        method: "POST",
+        body: JSON.stringify({ count: 3, tier: "yearly", customerName: "Roll Back", customerEmail: "rb@example.com" }),
+      });
+      expect(gen.status).toBe(500);
+      expect(gen.body.code).toBe("GEN_FAILED");
+    } finally {
+      dbAny.batch = realBatch;
+    }
+    // The failed batch (and every retry) committed nothing.
+    expect(await countAll()).toBe(1);
+  });
+
+  it("the same Idempotency-Key replays the committed batch without duplicates", async () => {
+    const body = JSON.stringify({ count: 3, tier: "lifetime", customerName: "Idem Ian", customerEmail: "ian@example.com" });
+    const first = await admin("/v1/admin/keys", { method: "POST", headers: { "Idempotency-Key": "webhook-retry-1" }, body });
+    expect(first.status).toBe(200);
+    expect(first.body.keys.length).toBe(3);
+    expect(first.body.replayed).toBeUndefined(); // first hit returns RAW keys
+    const rawKeys = (first.body.keys as { key: string }[]).map((k) => k.key);
+    for (const k of rawKeys) expect(normalizeKey(k).length).toBe(22);
+
+    // The webhook retries the SAME request (network blip, at-least-once
+    // delivery) with the same Idempotency-Key.
+    const second = await admin("/v1/admin/keys", { method: "POST", headers: { "Idempotency-Key": "webhook-retry-1" }, body });
+    expect(second.status).toBe(200);
+    expect(second.body.replayed).toBe(true);
+    expect(second.body.keys.length).toBe(3);
+    // Replays carry the publicLicense view ONLY — raw keys exist only in
+    // the FIRST response (they are never stored, so cannot be re-shown).
+    for (const k of second.body.keys as Record<string, any>[]) {
+      expect(k.key).toBeUndefined();
+      expect(k.keyLast4).toBeDefined();
+    }
+    // No duplicates were created, and the replayed rows ARE the first batch.
+    expect(await countAll()).toBe(3);
+    const list = await admin("/v1/admin/keys?limit=10");
+    expect(list.body.total).toBe(3);
+    const last4s = (list.body.keys as { keyLast4: string }[]).map((k) => k.keyLast4).sort();
+    expect(last4s).toEqual(rawKeys.map((k) => normalizeKey(k).slice(-4)).sort());
+
+    // A DIFFERENT idempotency key mints a fresh batch (not a replay).
+    const third = await admin("/v1/admin/keys", { method: "POST", headers: { "Idempotency-Key": "webhook-retry-2" }, body });
+    expect(third.status).toBe(200);
+    expect(third.body.replayed).toBeUndefined();
+    expect(await countAll()).toBe(6);
+  });
+
+  it("idempotencyKey also works as a JSON body field", async () => {
+    const body = JSON.stringify({ count: 1, tier: "yearly", customerName: "Body Field", customerEmail: "bf@example.com", idempotencyKey: "body-field-1" });
+    const a = await admin("/v1/admin/keys", { method: "POST", body });
+    expect(a.status).toBe(200);
+    const b = await admin("/v1/admin/keys", { method: "POST", body });
+    expect(b.status).toBe(200);
+    expect(b.body.replayed).toBe(true);
+    expect(await countAll()).toBe(1);
+  });
+});
+
+describe("token kid + aud claims (rotation groundwork)", () => {
+  // A manually minted token in the current wire shape — `claims`
+  // overrides the rotation claims so each test constructs exactly the
+  // variant it needs (legacy, wrong-aud, unknown-kid, ...).
+  const mintManual = async (claims: { kid?: number; aud?: string }): Promise<string> => {
+    const now = Math.floor(Date.now() / 1000);
+    return signToken(TEST_SIGNING_SEED, {
+      iss: "db-license", ver: 1, jti: "ab".repeat(16), iat: now, exp: now + 86_400,
+      key: "cd".repeat(32), tier: "lifetime", name: "Manual Mint", email: "mm@example.com",
+      hw: "ef".repeat(32), plat: "windows", lexp: null, ...claims,
+    });
+  };
+  const verifyViaApi = (token: string) => call(signedRequest("POST", "/v1/verify", { token }));
+
+  it("a LEGACY token (minted before kid/aud) still verifies — the compat window", async () => {
+    // The deployed fleet carries tokens without the new claims; the
+    // verification path must accept them unchanged until the fleet has
+    // turned over (same principle as the UA compat window).
+    const res = await verifyViaApi(await mintManual({}));
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(true);
+    expect(res.body.payload.kid).toBeUndefined();
+    expect(res.body.payload.aud).toBeUndefined();
+  });
+
+  it("a token minted for ANOTHER product fails with 403 BAD_AUDIENCE", async () => {
+    const res = await verifyViaApi(await mintManual({ aud: "other-product" }));
+    expect(res.status).toBe(403);
+    expect(res.body.ok).toBe(false);
+    expect(res.body.code).toBe("BAD_AUDIENCE");
+  });
+
+  it("a token naming an UNKNOWN key id fails verification (BAD_SIGNATURE)", async () => {
+    // Signature is genuine, but the token claims a key we never minted
+    // with — a rotation-claim forgery, rejected at the signature level.
+    const res = await verifyViaApi(await mintManual({ kid: 7 }));
+    expect(res.status).toBe(401);
+    expect(res.body.code).toBe("BAD_SIGNATURE");
+  });
+
+  it("a manually minted kid=1/aud=diskgenie token verifies", async () => {
+    const res = await verifyViaApi(await mintManual({ kid: 1, aud: "diskgenie" }));
+    expect(res.status).toBe(200);
+    expect(res.body.valid).toBe(true);
+    expect(res.body.payload.kid).toBe(1);
+    expect(res.body.payload.aud).toBe("diskgenie");
   });
 });
 
